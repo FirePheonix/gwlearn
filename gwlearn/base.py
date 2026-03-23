@@ -11,10 +11,10 @@ import pandas as pd
 from joblib import Parallel, delayed, dump, load
 from libpysal import graph
 from scipy.spatial import KDTree
-from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, TransformerMixin
 from sklearn.model_selection import train_test_split
 
-__all__ = ["BaseClassifier", "BaseRegressor"]
+__all__ = ["BaseClassifier", "BaseRegressor", "BaseDecomposition"]
 
 
 def _triangular(distances: np.ndarray, bandwidth: np.ndarray | float) -> np.ndarray:
@@ -169,13 +169,13 @@ class _BaseModel(BaseEstimator):
     def _fit_models_batch(
         self,
         X: pd.DataFrame,
-        y: pd.Series,
+        y: pd.Series | None,
         weights: graph.Graph,
     ) -> list:
         """Fit models in batches or all at once"""
         if self.batch_size:
             training_output = []
-            num_groups = len(y)
+            num_groups = len(y) if y is not None else len(X)
             indices = np.arange(num_groups)
             for i in range(0, num_groups, self.batch_size):
                 if self.verbose:
@@ -205,29 +205,31 @@ class _BaseModel(BaseEstimator):
     def _batch_fit(
         self,
         X: pd.DataFrame,
-        y: pd.Series,
+        y: pd.Series | None,
         index: pd.MultiIndex,
         _weight: np.ndarray,
         X_focals: np.ndarray,
     ) -> list:
         """Fit a batch of local models"""
         data = X.copy()
-        data["_y"] = y
+        if y is not None:
+            data["_y"] = y
         data = data.loc[index.get_level_values(1)]
         data["_weight"] = _weight
         grouper = data.groupby(index.get_level_values(0), sort=False)
 
-        invariant = grouper["_y"].nunique() == 1
-        if invariant.any():
-            if self.strict:
-                raise ValueError(
-                    f"y at locations {invariant.index[invariant]} is invariant."
-                )
-            elif self.strict is None:
-                warnings.warn(
-                    f"y at locations {invariant.index[invariant]} is invariant.",
-                    stacklevel=3,
-                )
+        if y is not None:
+            invariant = grouper["_y"].nunique() == 1
+            if invariant.any():
+                if self.strict:
+                    raise ValueError(
+                        f"y at locations {invariant.index[invariant]} is invariant."
+                    )
+                elif self.strict is None:
+                    warnings.warn(
+                        f"y at locations {invariant.index[invariant]} is invariant.",
+                        stacklevel=3,
+                    )
 
         return Parallel(n_jobs=self.n_jobs, temp_folder=self.temp_folder)(
             delayed(self._fit_local)(
@@ -240,7 +242,7 @@ class _BaseModel(BaseEstimator):
             for (name, group), focal_x in zip(grouper, X_focals, strict=False)
         )
 
-    def _fit_global_model(self, X: pd.DataFrame, y: pd.Series):
+    def _fit_global_model(self, X: pd.DataFrame, y: pd.Series | None):
         """Fit global baseline model"""
         if self._model_type == "random_forest":
             self._model_kwargs["oob_score"] = True
@@ -257,7 +259,10 @@ class _BaseModel(BaseEstimator):
                 message="'n_jobs' has no effect since 1.8 and will be removed in 1.10.",
                 category=FutureWarning,
             )
-            self.global_model.fit(X=X, y=y)
+            if y is not None:
+                self.global_model.fit(X=X, y=y)
+            else:
+                self.global_model.fit(X=X)
 
     def _store_model(self, local_model, name: Hashable):
         """Store or serialize local model"""
@@ -1795,3 +1800,295 @@ class BaseRegressor(_BaseModel, RegressorMixin):
         ss_res = ((y_true - y_pred) ** 2).sum()
         ss_tot = ((y_true - y_true.mean()) ** 2).sum()
         return 1 - ss_res / ss_tot if ss_tot != 0 else float("nan")
+
+
+class BaseDecomposition(TransformerMixin, _BaseModel):
+    """Base class for geographically weighted matrix decomposition models.
+
+    Unsupervised counterpart to ``BaseClassifier`` / ``BaseRegressor``.
+    Implements :class:`sklearn.base.TransformerMixin` (``fit`` + ``transform``)
+    instead of the supervised predict pattern.
+
+    Each subclass must implement :meth:`_fit_local`, which receives a local
+    neighborhood data frame (with a ``"_weight"`` column) and the focal point
+    vector, and returns ``[name, eigenvectors, eigenvalues, focal_score, local_mean]``.
+
+    Parameters
+    ----------
+    bandwidth : float | int | None
+        Bandwidth. Distance threshold if ``fixed=True``, else number of neighbours.
+    fixed : bool
+        Fixed distance (True) or adaptive KNN (False), by default False.
+    kernel : str
+        Kernel function name, by default ``"bisquare"``.
+    include_focal : bool
+        Include the focal observation in its own neighbourhood. GWmodel always
+        includes the focal point, so this defaults to ``True`` for decomposition
+        models (contrast with supervised models where it defaults to ``False``).
+    graph : libpysal.graph.Graph | None
+        Pre-computed spatial weights. Overrides bandwidth/kernel if supplied.
+    n_jobs : int
+        Parallelism, by default ``-1`` (all CPUs).
+    fit_global_model : bool
+        Fit a global (non-GW) PCA baseline alongside the local models, stored as
+        ``self.global_model``. Uses :class:`sklearn.decomposition.PCA`.
+    keep_models : bool | str | Path
+        Retain local eigenvectors in memory (or on disk). By default False.
+    temp_folder : str | None
+        joblib memmapping folder for large arrays.
+    batch_size : int | None
+        Process focal points in batches (reduces peak memory).
+    verbose : bool
+        Print progress, by default False.
+    """
+
+    def __init__(
+        self,
+        *,
+        bandwidth: float | None = None,
+        fixed: bool = False,
+        kernel: str | Callable = "bisquare",
+        include_focal: bool = True,
+        graph: graph.Graph | None = None,
+        n_jobs: int = -1,
+        fit_global_model: bool = True,
+        keep_models: bool | str | Path = False,
+        temp_folder: str | None = None,
+        batch_size: int | None = None,
+        verbose: bool = False,
+    ):
+        # model=None — decomposition models manage their own local fitting logic
+        # rather than wrapping an sklearn estimator class.
+        super().__init__(
+            model=None,
+            bandwidth=bandwidth,
+            fixed=fixed,
+            kernel=kernel,
+            include_focal=include_focal,
+            graph=graph,
+            n_jobs=n_jobs,
+            fit_global_model=fit_global_model,
+            strict=False,
+            keep_models=keep_models,
+            temp_folder=temp_folder,
+            batch_size=batch_size,
+            verbose=verbose,
+        )
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: None = None,  # noqa: ARG002  — present for sklearn Pipeline compat
+        geometry: gpd.GeoSeries | None = None,
+    ) -> "BaseDecomposition":
+        """Fit geographically weighted decomposition at every spatial location.
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Feature matrix (n_observations × n_features). Should be standardised
+            (zero mean, unit variance) before calling, following Harris et al. (2011).
+        y : None
+            Ignored. Present only for scikit-learn ``Pipeline`` compatibility.
+        geometry : gpd.GeoSeries | None
+            Point geometry for each row in ``X``. Required unless ``graph`` was
+            passed to the constructor.
+
+        Returns
+        -------
+        self
+        """
+        self._start = time()
+        self.geometry = geometry
+
+        if self.graph is not None:
+            weights = self.graph
+        else:
+            self._validate_geometry(self.geometry)
+            weights = self._build_weights()
+
+        if self.verbose:
+            print(f"{(time() - self._start):.2f}s: Weights built")
+
+        self._setup_model_storage()
+
+        if isinstance(X, pd.DataFrame):
+            self.feature_names_in_ = X.columns.to_numpy()
+        else:
+            self.feature_names_in_ = np.arange(X.shape[1])
+        self.n_features_in_ = X.shape[1]
+
+        if self.verbose:
+            print(f"{(time() - self._start):.2f}s: Fitting {len(X)} local models")
+
+        training_output = self._fit_models_batch(X, y=None, weights=weights)
+
+        # Unpack results from each local fit
+        names, eigvecs, eigvals, scores, means = zip(*training_output, strict=False)
+
+        self._names = list(names)
+
+        # shapes: components_ → (n_loc, n_features, n_components)
+        #         eigenvalues_ / scores_ → (n_loc, n_components)
+        #         local_means_ → (n_loc, n_features)
+        self._components = np.array(eigvecs)
+        self._eigenvalues = np.array(eigvals)
+        self._scores = np.array(scores)
+        self._local_means = np.array(means)
+
+        if self.verbose:
+            print(f"{(time() - self._start):.2f}s: Local models fitted")
+
+        if self.fit_global_model:
+            self._fit_global_model_decomposition(X)
+
+        return self
+
+    def _fit_global_model_decomposition(self, X: pd.DataFrame):
+        """Fit global PCA as a non-GW baseline stored in ``self.global_model``."""
+        from sklearn.decomposition import PCA
+
+        n_components = getattr(self, "n_components", None)
+        self.global_model = PCA(n_components=n_components)
+        self.global_model.fit(X)
+
+    # ------------------------------------------------------------------
+    # Output properties
+    # ------------------------------------------------------------------
+
+    @property
+    def components_(self) -> np.ndarray:
+        """Local principal component loadings.
+
+        Shape: ``(n_locations, n_features, n_components)``.
+        Equivalent to ``w`` in GWmodel's ``gwpca`` output.
+        """
+        return self._components
+
+    @property
+    def explained_variance_(self) -> np.ndarray:
+        """Local eigenvalues (variance per component).
+
+        Shape: ``(n_locations, n_components)``.
+        Equivalent to ``d`` in GWmodel's ``gwpca`` output.
+        """
+        return self._eigenvalues
+
+    @property
+    def explained_variance_ratio_(self) -> np.ndarray:
+        """Fraction of total local variance explained by each component.
+
+        Shape: ``(n_locations, n_components)``.
+        Equivalent to ``local.PV / 100`` in GWmodel's ``gwpca`` output.
+        """
+        totals = self._eigenvalues.sum(axis=1, keepdims=True)
+        # Avoid division by zero for degenerate neighborhoods
+        return np.where(totals > 0, self._eigenvalues / totals, 0.0)
+
+    @property
+    def scores_(self) -> np.ndarray:
+        """Local component scores for each focal observation.
+
+        Shape: ``(n_locations, n_components)``.
+        These are the projections of the focal point onto its local loadings.
+        """
+        return self._scores
+
+    @property
+    def local_means_(self) -> np.ndarray:
+        """Geographically weighted mean vector at each focal location.
+
+        Shape: ``(n_locations, n_features)``.
+        """
+        return self._local_means
+
+    @property
+    def winning_variable_(self) -> pd.Series:
+        """Feature with the highest absolute loading on PC1 at each location.
+
+        Equivalent to ``win_var_PC1`` in GWmodel's ``gwpca`` SDF output.
+        Returns a Series indexed by location name.
+        """
+        # components_ shape: (n_loc, n_features, n_components)
+        # column 0 = PC1 loadings for each feature
+        pc1_loadings = np.abs(self._components[:, :, 0])
+        winning_idx = np.argmax(pc1_loadings, axis=1)
+        return pd.Series(
+            self.feature_names_in_[winning_idx],
+            index=self._names,
+            name="winning_variable_PC1",
+        )
+
+    @property
+    def condition_number_(self) -> pd.Series:
+        """Matrix condition number of the local covariance matrix.
+
+        High condition numbers (> 30) indicate local collinearity, which is
+        useful for diagnosing GWR collinearity as described in
+        Harris et al. (2011, §4.5).
+
+        Returns a Series indexed by location name.
+        """
+        conds = []
+        for i in range(len(self._names)):
+            # Reconstruct local covariance from eigendecomposition
+            # Σ = L V Lᵀ  ⇒  condition = max(eigenvalue) / min(eigenvalue)
+            eigs = np.abs(self._eigenvalues[i])
+            min_e = eigs[eigs > 0].min() if (eigs > 0).any() else np.nan
+            max_e = eigs.max()
+            conds.append(max_e / min_e if min_e > 0 else np.inf)
+        return pd.Series(conds, index=self._names, name="condition_number")
+
+    # ------------------------------------------------------------------
+    # transform
+    # ------------------------------------------------------------------
+
+    def transform(
+        self,
+        X: pd.DataFrame,
+        geometry: gpd.GeoSeries | None = None,
+    ) -> np.ndarray:
+        """Project observations onto their nearest local principal components.
+
+        For each new observation, the nearest training location is found via a
+        spatial index and the data are projected onto that location's local loadings.
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+            New feature matrix.
+        geometry : gpd.GeoSeries
+            Point geometry for the rows of ``X``.
+
+        Returns
+        -------
+        np.ndarray, shape ``(n_samples, n_components)``
+            Local component scores.
+        """
+        self._validate_geometry(geometry)
+        if self.geometry is None:
+            raise ValueError(
+                "Training geometry must be stored. Re-fit with geometry= specified."
+            )
+
+        # Nearest-neighbour lookup: for each new point → index into training set
+        nn_indices = self.geometry.sindex.nearest(geometry, return_all=False)[1].flatten()
+
+        results = []
+        X_vals = X.values if isinstance(X, pd.DataFrame) else X
+        for src_idx, x_row in zip(nn_indices, X_vals):
+            v = self._components[src_idx]      # (n_features, n_components)
+            mu = self._local_means[src_idx]    # (n_features,)
+            results.append((x_row - mu) @ v)
+
+        return np.array(results)
+
+    def fit_transform(
+        self,
+        X: pd.DataFrame,
+        y: None = None,
+        geometry: gpd.GeoSeries | None = None,
+    ) -> np.ndarray:
+        """Fit and return focal-point scores (shortcut for ``fit`` then ``scores_``)."""
+        self.fit(X, geometry=geometry)
+        return self._scores

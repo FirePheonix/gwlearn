@@ -155,7 +155,10 @@ class BandwidthSearch:
         self.verbose = verbose
 
     def fit(
-        self, X: pd.DataFrame, y: pd.Series, geometry: gpd.GeoSeries
+        self,
+        X: pd.DataFrame,
+        y: pd.Series | None = None,
+        geometry: gpd.GeoSeries | None = None,
     ) -> "BandwidthSearch":
         """
         Fit the searcher by evaluating candidate bandwidths on the provided data.
@@ -164,12 +167,13 @@ class BandwidthSearch:
         ----------
         X : pd.DataFrame
             Feature matrix used to evaluate candidate bandwidths (rows are samples).
-        y : pd.Series
-            Target values corresponding to X.
+        y : pd.Series | None
+            Target values corresponding to X. Pass ``None`` for unsupervised models
+            such as :class:`gwlearn.decomposition.GWPCA`, in which case
+            ``criterion`` should be ``"cv_score"`` (the leave-one-out
+            reconstruction error of Harris et al. 2011, §4.1).
         geometry : gpd.GeoSeries
-            Geographic location of the observations in the sample. Used to determine the
-            spatial interaction weight based on specification by ``bandwidth``,
-            ``fixed``, ``kernel``, and ``include_focal`` keywords.
+            Geographic location of the observations in the sample.
 
         Returns
         -------
@@ -195,12 +199,39 @@ class BandwidthSearch:
         return self
 
     def _score(
-        self, X: pd.DataFrame, y: pd.Series, bw: int | float
+        self, X: pd.DataFrame, y: pd.Series | None, bw: int | float
     ) -> tuple[float, list[float]]:
         """Fit the model and report criterion score.
 
-        In case of invariant y in a local model, returns np.inf
+        For supervised models: returns the chosen information criterion.
+        For unsupervised models (y=None): returns the CV reconstruction error
+        (Harris et al. 2011, §4.1) when criterion="cv_score", or any attribute
+        ``m + "_"`` from the fitted model for a custom string criterion.
+
+        In case of invariant y in a local model, returns np.inf.
         """
+        # --- unsupervised path (y is None) ---
+        if y is None:
+            gwm = self.model(
+                bandwidth=bw,
+                fixed=self.fixed,
+                kernel=self.kernel,
+                n_jobs=self.n_jobs,
+                fit_global_model=False,
+                verbose=self.verbose == 2,
+                **self._model_kwargs,
+            ).fit(X=X, geometry=self.geometry, cv=(self.criterion == "cv_score"))
+
+            met = ["cv_score"] + (self.metrics or [])
+            all_metrics = []
+            for m in met:
+                val = getattr(gwm, m + "_", np.nan)
+                all_metrics.append(float(val) if val is not None else np.nan)
+
+            criterion_idx = met.index(self.criterion) if self.criterion in met else 0
+            return all_metrics[criterion_idx], all_metrics
+
+        # --- supervised path (original logic) ---
         if len(np.unique(y)) == 1:
             return (np.inf, [])
 
@@ -220,15 +251,12 @@ class BandwidthSearch:
             met += self.metrics
 
         if hasattr(gwm, "prediction_rate_") and gwm.prediction_rate_ == 0:
-            # prediction rate should report 0, everything else is undefined
             score = (
                 gwm.prediction_rate_ if self.criterion == "prediction_rate" else np.nan
             )
-
             all_metrics = [
                 gwm.prediction_rate_ if m == "prediction_rate" else np.nan for m in met
             ]
-
             return score, all_metrics
 
         all_metrics = []
@@ -241,7 +269,7 @@ class BandwidthSearch:
 
         return all_metrics[met.index(self.criterion)], all_metrics
 
-    def _interval(self, X: pd.DataFrame, y: pd.Series) -> None:
+    def _interval(self, X: pd.DataFrame, y: pd.Series | None) -> None:
         """Fit models using the equal interval search.
 
         Parameters
@@ -274,14 +302,18 @@ class BandwidthSearch:
         self.scores_ = pd.Series(scores, name=self.criterion)
         self.metrics_ = pd.DataFrame(
             metrics,
-            index=pd.Index(
-                ["aicc", "aic", "bic"] + self.metrics
-                if self.metrics
-                else ["aicc", "aic", "bic"]
-            ),
+            index=pd.Index(self._metrics_index(y)),
         ).T
 
-    def _golden_section(self, X: pd.DataFrame, y: pd.Series, tolerance: float) -> None:
+    def _metrics_index(self, y: pd.Series | None) -> list:
+        """Return the metrics index depending on supervised/unsupervised mode."""
+        if y is None:
+            base = ["cv_score"]
+        else:
+            base = ["aicc", "aic", "bic"]
+        return base + (self.metrics or [])
+
+    def _golden_section(self, X: pd.DataFrame, y: pd.Series | None, tolerance: float) -> None:
         delta = 0.38197
         if self.fixed:
             pairwise_distance = pdist(self.geometry.get_coordinates())
@@ -291,7 +323,12 @@ class BandwidthSearch:
             a = min_dist / 2.0
             c = max_dist * 2.0
         else:
-            a = 40 + 2 * X.shape[1]
+            if y is None:
+                # Unsupervised (GWPCA): need ≥ n_features+1 neighbours to form
+                # a non-singular covariance matrix. Use max(n_features+2, 10).
+                a = max(X.shape[1] + 2, 10)
+            else:
+                a = 40 + 2 * X.shape[1]
             c = len(self.geometry)
 
         if self.min_bandwidth:
@@ -365,9 +402,5 @@ class BandwidthSearch:
         self.scores_ = pd.Series(scores)
         self.metrics_ = pd.DataFrame(
             metrics,
-            index=pd.Index(
-                ["aicc", "aic", "bic"] + self.metrics
-                if self.metrics
-                else ["aicc", "aic", "bic"]
-            ),
+            index=pd.Index(self._metrics_index(y)),
         ).T

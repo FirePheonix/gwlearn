@@ -1,6 +1,24 @@
 import geopandas as gpd
+import numpy as np
 import pytest
 from geodatasets import get_path
+
+
+@pytest.fixture(scope="session")
+def sample_decomposition_data():
+    """Return standardised multivariate data for unsupervised decomposition tests.
+
+    Uses the Guerry dataset with 5 socio-economic features.
+    Data are standardised (zero mean, unit variance) following Harris et al. (2011, §3).
+    No target variable — for GWPCA / RobustGWPCA.
+    """
+    gdf = gpd.read_file(get_path("geoda.guerry"))
+    gdf = gdf.set_geometry(gdf.centroid)
+    cols = ["Crm_prs", "Litercy", "Wealth", "Donatns", "Infants"]
+    X = gdf[cols].astype(float)
+    X = (X - X.mean()) / X.std()  # standardise as per Harris et al. (2011)
+    geometry = gdf.geometry
+    return X, geometry
 
 
 @pytest.fixture(scope="session")
