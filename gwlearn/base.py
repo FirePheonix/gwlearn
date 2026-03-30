@@ -1803,43 +1803,89 @@ class BaseRegressor(_BaseModel, RegressorMixin):
 
 
 class BaseDecomposition(TransformerMixin, _BaseModel):
-    """Base class for geographically weighted matrix decomposition models.
+    """Base class for all geographically weighted decomposition models.
 
-    Unsupervised counterpart to ``BaseClassifier`` / ``BaseRegressor``.
-    Implements :class:`sklearn.base.TransformerMixin` (``fit`` + ``transform``)
-    instead of the supervised predict pattern.
+    Unsupervised counterpart to ``BaseRegressor`` / ``BaseClassifier``.
+    Handles the full spatial loop, kernel weights, joblib parallelism,
+    output packing, and sklearn compatibility. Subclasses implement
+    **one method only**: :meth:`_fit_local`.
 
-    Each subclass must implement :meth:`_fit_local`, which receives a local
-    neighborhood data frame (with a ``"_weight"`` column) and the focal point
-    vector, and returns ``[name, eigenvectors, eigenvalues, focal_score, local_mean]``.
+    Extending BaseDecomposition
+    ---------------------------
+    To add a new GW decomposition algorithm, subclass this and implement
+    ``_fit_local``. Everything else — spatial weights, parallelism, output
+    attributes, Pipeline routing, ``get_params`` / ``clone`` — is inherited.
+
+    Minimal example (Geographically Weighted ICA)::
+
+        class GWICA(BaseDecomposition):
+            def __init__(self, n_components, *, bandwidth, **kwargs):
+                self.n_components = n_components
+                super().__init__(bandwidth=bandwidth, **kwargs)
+
+            def _fit_local(self, model, data, name, focal_x, model_kwargs):
+                from sklearn.decomposition import FastICA
+                X_local = data.drop(columns=["_weight"]).values.astype(float)
+                wt      = data["_weight"].values.astype(float)
+                wm      = np.average(X_local, axis=0, weights=wt)
+                Xs      = (X_local - wm) * np.sqrt(wt[:, None])
+                ica     = FastICA(n_components=self.n_components).fit(Xs)
+                comps   = ica.components_.T           # (p, q)
+                vals    = np.sum(comps**2, axis=0)    # variance proxy
+                score   = (focal_x - wm) @ comps
+                return [name, comps, vals, score, wm]
+
+    The ``_fit_local`` contract
+    --------------------------
+    Signature::
+
+        _fit_local(self, model, data, name, focal_x, model_kwargs) -> list
+
+    Arguments:
+        data      : pd.DataFrame — neighbourhood rows; columns = features + "_weight"
+        name      : hashable    — focal point identifier (used as index in outputs)
+        focal_x   : np.ndarray  — feature vector of the focal point, shape (p,)
+        model     : None        — unused for decomposition; kept for interface parity
+        model_kwargs : dict     — unused
+
+    Return value (a plain list, 5 elements)::
+
+        [name, eigenvectors, eigenvalues, focal_score, local_mean]
+        #       (p, q)        (q,)          (q,)         (p,)
+
+    After all focal fits, ``BaseDecomposition.fit()`` stacks these into:
+        self.components_              → (n, p, q)
+        self.explained_variance_      → (n, q)
+        self.explained_variance_ratio_→ (n, q)
+        self.scores_                  → (n, q)
+        self.local_means_             → (n, p)
+        self.winning_variable_        → pd.Series (n,)
+        self.condition_number_        → pd.Series (n,)
 
     Parameters
     ----------
     bandwidth : float | int | None
-        Bandwidth. Distance threshold if ``fixed=True``, else number of neighbours.
+        KNN count (fixed=False) or distance threshold (fixed=True).
     fixed : bool
-        Fixed distance (True) or adaptive KNN (False), by default False.
+        Adaptive KNN (False) or fixed distance (True). Default False.
     kernel : str
-        Kernel function name, by default ``"bisquare"``.
+        Kernel function. Default ``"bisquare"``.
     include_focal : bool
-        Include the focal observation in its own neighbourhood. GWmodel always
-        includes the focal point, so this defaults to ``True`` for decomposition
-        models (contrast with supervised models where it defaults to ``False``).
+        Include the focal point in its own neighbourhood. Default True.
     graph : libpysal.graph.Graph | None
-        Pre-computed spatial weights. Overrides bandwidth/kernel if supplied.
+        Pre-built spatial weights. Overrides bandwidth/kernel if given.
     n_jobs : int
-        Parallelism, by default ``-1`` (all CPUs).
+        Joblib parallelism. -1 uses all CPUs.
     fit_global_model : bool
-        Fit a global (non-GW) PCA baseline alongside the local models, stored as
-        ``self.global_model``. Uses :class:`sklearn.decomposition.PCA`.
+        Fit a global sklearn PCA baseline alongside local models.
     keep_models : bool | str | Path
-        Retain local eigenvectors in memory (or on disk). By default False.
+        Store local models in memory or on disk. Default False.
     temp_folder : str | None
-        joblib memmapping folder for large arrays.
+        Joblib memmapping folder.
     batch_size : int | None
-        Process focal points in batches (reduces peak memory).
+        Process focal points in batches to reduce peak memory.
     verbose : bool
-        Print progress, by default False.
+        Print progress. Default False.
     """
 
     def __init__(
@@ -1857,8 +1903,6 @@ class BaseDecomposition(TransformerMixin, _BaseModel):
         batch_size: int | None = None,
         verbose: bool = False,
     ):
-        # model=None — decomposition models manage their own local fitting logic
-        # rather than wrapping an sklearn estimator class.
         super().__init__(
             model=None,
             bandwidth=bandwidth,
@@ -1878,21 +1922,23 @@ class BaseDecomposition(TransformerMixin, _BaseModel):
     def fit(
         self,
         X: pd.DataFrame,
-        y: None = None,  # noqa: ARG002  — present for sklearn Pipeline compat
+        y: None = None,  # noqa: ARG002
         geometry: gpd.GeoSeries | None = None,
     ) -> "BaseDecomposition":
         """Fit geographically weighted decomposition at every spatial location.
 
+        Runs the spatial loop: builds kernel weights, dispatches ``_fit_local``
+        at every focal point via joblib, then packs all results into output
+        attributes. Subclasses do not need to override this.
+
         Parameters
         ----------
         X : pd.DataFrame
-            Feature matrix (n_observations × n_features). Should be standardised
-            (zero mean, unit variance) before calling, following Harris et al. (2011).
+            Feature matrix. Standardise (zero mean, unit variance) before calling.
         y : None
-            Ignored. Present only for scikit-learn ``Pipeline`` compatibility.
+            Ignored. Present for sklearn Pipeline compatibility.
         geometry : gpd.GeoSeries | None
-            Point geometry for each row in ``X``. Required unless ``graph`` was
-            passed to the constructor.
+            Point geometry for each row. Required unless ``graph`` was set at init.
 
         Returns
         -------
@@ -1923,18 +1969,13 @@ class BaseDecomposition(TransformerMixin, _BaseModel):
 
         training_output = self._fit_models_batch(X, y=None, weights=weights)
 
-        # Unpack results from each local fit
         names, eigvecs, eigvals, scores, means = zip(*training_output, strict=False)
 
         self._names = list(names)
-
-        # shapes: components_ → (n_loc, n_features, n_components)
-        #         eigenvalues_ / scores_ → (n_loc, n_components)
-        #         local_means_ → (n_loc, n_features)
-        self._components = np.array(eigvecs)
-        self._eigenvalues = np.array(eigvals)
-        self._scores = np.array(scores)
-        self._local_means = np.array(means)
+        self._components = np.array(eigvecs)    # (n, p, q)
+        self._eigenvalues = np.array(eigvals)   # (n, q)
+        self._scores = np.array(scores)         # (n, q)
+        self._local_means = np.array(means)     # (n, p)
 
         if self.verbose:
             print(f"{(time() - self._start):.2f}s: Local models fitted")
@@ -1945,72 +1986,52 @@ class BaseDecomposition(TransformerMixin, _BaseModel):
         return self
 
     def _fit_global_model_decomposition(self, X: pd.DataFrame):
-        """Fit global PCA as a non-GW baseline stored in ``self.global_model``."""
+        """Fit global sklearn PCA baseline stored as ``self.global_model``."""
         from sklearn.decomposition import PCA
 
         n_components = getattr(self, "n_components", None)
         self.global_model = PCA(n_components=n_components)
         self.global_model.fit(X)
 
-    # ------------------------------------------------------------------
-    # Output properties
-    # ------------------------------------------------------------------
-
     @property
     def components_(self) -> np.ndarray:
-        """Local principal component loadings.
-
-        Shape: ``(n_locations, n_features, n_components)``.
-        Equivalent to ``w`` in GWmodel's ``gwpca`` output.
-        """
+        """Local eigenvectors (loadings). Shape ``(n, p, q)``."""
         return self._components
 
     @property
     def explained_variance_(self) -> np.ndarray:
-        """Local eigenvalues (variance per component).
-
-        Shape: ``(n_locations, n_components)``.
-        Equivalent to ``d`` in GWmodel's ``gwpca`` output.
-        """
+        """Local eigenvalues. Shape ``(n, q)``."""
         return self._eigenvalues
 
     @property
     def explained_variance_ratio_(self) -> np.ndarray:
-        """Fraction of total local variance explained by each component.
-
-        Shape: ``(n_locations, n_components)``.
-        Equivalent to ``local.PV / 100`` in GWmodel's ``gwpca`` output.
-        """
+        """Local fraction of variance per component. Shape ``(n, q)``."""
         totals = self._eigenvalues.sum(axis=1, keepdims=True)
-        # Avoid division by zero for degenerate neighborhoods
         return np.where(totals > 0, self._eigenvalues / totals, 0.0)
+
+    def inverse_transform(self, scores: np.ndarray | None = None) -> np.ndarray:
+        """Reconstruct X from local scores. Shape ``(n, p)``."""
+        if scores is None:
+            scores = self._scores
+        return self._local_means + np.einsum("nq,npq->np", scores, self._components)
 
     @property
     def scores_(self) -> np.ndarray:
-        """Local component scores for each focal observation.
-
-        Shape: ``(n_locations, n_components)``.
-        These are the projections of the focal point onto its local loadings.
-        """
+        """Focal-point projection onto its local components. Shape ``(n, q)``."""
         return self._scores
 
     @property
     def local_means_(self) -> np.ndarray:
-        """Geographically weighted mean vector at each focal location.
-
-        Shape: ``(n_locations, n_features)``.
-        """
+        """Geographically weighted mean at each focal location. Shape ``(n, p)``."""
         return self._local_means
 
     @property
     def winning_variable_(self) -> pd.Series:
-        """Feature with the highest absolute loading on PC1 at each location.
+        """Variable with the highest absolute PC1 loading at each location.
 
-        Equivalent to ``win_var_PC1`` in GWmodel's ``gwpca`` SDF output.
-        Returns a Series indexed by location name.
+        Returns a ``pd.Series`` indexed by location name.
+        Equivalent to ``win_var_PC1`` in GWmodel's SDF output.
         """
-        # components_ shape: (n_loc, n_features, n_components)
-        # column 0 = PC1 loadings for each feature
         pc1_loadings = np.abs(self._components[:, :, 0])
         winning_idx = np.argmax(pc1_loadings, axis=1)
         return pd.Series(
@@ -2021,18 +2042,12 @@ class BaseDecomposition(TransformerMixin, _BaseModel):
 
     @property
     def condition_number_(self) -> pd.Series:
-        """Matrix condition number of the local covariance matrix.
+        """Local covariance condition number (max/min eigenvalue). Shape ``(n,)``.
 
-        High condition numbers (> 30) indicate local collinearity, which is
-        useful for diagnosing GWR collinearity as described in
-        Harris et al. (2011, §4.5).
-
-        Returns a Series indexed by location name.
+        Values > 30 flag near-collinear neighbourhoods (Harris et al. 2011, §4.5).
         """
         conds = []
         for i in range(len(self._names)):
-            # Reconstruct local covariance from eigendecomposition
-            # Σ = L V Lᵀ  ⇒  condition = max(eigenvalue) / min(eigenvalue)
             eigs = np.abs(self._eigenvalues[i])
             min_e = eigs[eigs > 0].min() if (eigs > 0).any() else np.nan
             max_e = eigs.max()
@@ -2040,7 +2055,7 @@ class BaseDecomposition(TransformerMixin, _BaseModel):
         return pd.Series(conds, index=self._names, name="condition_number")
 
     # ------------------------------------------------------------------
-    # transform
+    # transform / fit_transform
     # ------------------------------------------------------------------
 
     def transform(
@@ -2048,22 +2063,21 @@ class BaseDecomposition(TransformerMixin, _BaseModel):
         X: pd.DataFrame,
         geometry: gpd.GeoSeries | None = None,
     ) -> np.ndarray:
-        """Project observations onto their nearest local principal components.
+        """Project new observations onto their nearest local components.
 
-        For each new observation, the nearest training location is found via a
-        spatial index and the data are projected onto that location's local loadings.
+        Finds the nearest training location for each point via spatial index
+        and projects ``X`` onto that location's eigenvectors.
 
         Parameters
         ----------
         X : pd.DataFrame
-            New feature matrix.
+            Feature matrix to project.
         geometry : gpd.GeoSeries
-            Point geometry for the rows of ``X``.
+            Spatial locations for the rows of ``X``.
 
         Returns
         -------
         np.ndarray, shape ``(n_samples, n_components)``
-            Local component scores.
         """
         self._validate_geometry(geometry)
         if self.geometry is None:
@@ -2071,14 +2085,13 @@ class BaseDecomposition(TransformerMixin, _BaseModel):
                 "Training geometry must be stored. Re-fit with geometry= specified."
             )
 
-        # Nearest-neighbour lookup: for each new point → index into training set
         nn_indices = self.geometry.sindex.nearest(geometry, return_all=False)[1].flatten()
 
         results = []
         X_vals = X.values if isinstance(X, pd.DataFrame) else X
         for src_idx, x_row in zip(nn_indices, X_vals):
-            v = self._components[src_idx]      # (n_features, n_components)
-            mu = self._local_means[src_idx]    # (n_features,)
+            v = self._components[src_idx]
+            mu = self._local_means[src_idx]
             results.append((x_row - mu) @ v)
 
         return np.array(results)
@@ -2089,6 +2102,9 @@ class BaseDecomposition(TransformerMixin, _BaseModel):
         y: None = None,
         geometry: gpd.GeoSeries | None = None,
     ) -> np.ndarray:
-        """Fit and return focal-point scores (shortcut for ``fit`` then ``scores_``)."""
+        """Fit and return the focal-point scores.
+
+        Equivalent to ``fit(X, geometry=geometry).scores_``.
+        """
         self.fit(X, geometry=geometry)
         return self._scores
